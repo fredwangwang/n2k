@@ -4,19 +4,22 @@ import (
 	"log"
 
 	"github.com/hashicorp/nomad/api"
-	k8sv1 "k8s.io/client-go/applyconfigurations/apps/v1"
 	corev1 "k8s.io/client-go/applyconfigurations/core/v1"
 )
 
-func ToDeployment(group *api.TaskGroup, namespace string) *k8sv1.DeploymentApplyConfiguration {
-	dep := k8sv1.Deployment(*group.Name, namespace)
+// func ToDeployment(group *api.TaskGroup, namespace string) *v1.Deployment {
+// 	// dep := k8sv1.Deployment(*group.Name, namespace)
+// 	dep := v1.Deployment{}
+// 	dep.Name = *group.Name
 
-	depSepc := k8sv1.DeploymentSpec()
-	depSepc.WithTemplate(ToPodTemplateSpec(group))
+// 	depSepc := v1.DeploymentSpec{}
+// 	dep.Spec = depSepc
 
-	dep.WithSpec(depSepc)
-	return dep
-}
+// 	depSepc.WithTemplate(ToPodTemplateSpec(group))
+
+// 	dep.WithSpec(depSepc)
+// 	return dep
+// }
 
 func ToPodTemplateSpec(group *api.TaskGroup) *corev1.PodTemplateSpecApplyConfiguration {
 	podTpl := corev1.PodTemplateSpec()
@@ -29,8 +32,8 @@ func ToPodSpec(group api.TaskGroup) *corev1.PodSpecApplyConfiguration {
 	for _, task := range group.Tasks {
 		c := corev1.Container()
 		c.WithName(task.Name)
-		setImage(c, task.Config)
-		setArgs(c, task.Config)
+		// setImage(c, task.Config)
+		// setArgs(c, task.Config)
 
 		if len(task.Config) != 0 {
 			log.Printf("warn: unknown field(s) in config: %v", task.Config)
