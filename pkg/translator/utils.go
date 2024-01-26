@@ -1,6 +1,8 @@
 package translator
 
-import "reflect"
+import (
+	"reflect"
+)
 
 func AppendIfNotNil[T any](arr []T, v T) []T {
 	if reflect.ValueOf(&v).Elem().IsZero() {

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"text/template"
@@ -67,13 +68,22 @@ type Translator struct {
 
 	K8sCRs         []interface{}
 	K8sDeployemnts []*v1.Deployment
-	K8sConfigMpas  []*corev1.ConfigMap
-	K8sServices    []*corev1.Service
+	// When Generation CMs, the name could collide based on the original nomad template
+	// destination attribute
+	// thus using a map to better test collision than slice
+	K8sConfigMaps  map[string]*corev1.ConfigMap
+	// K8sConfigMpas   []*corev1.ConfigMap
+
+	K8sServices []*corev1.Service
 }
 
 // A job in nomad can contain muliple groups. Each group is mapped to a deployment (and a corresponding service)
 
 func (t *Translator) Process() error {
+	if t.K8sConfigMaps == nil {
+		t.K8sConfigMaps = make(map[string]*corev1.ConfigMap)
+	}
+
 	// TODO t.Job.Affinities to preferredDuringSchedulingIgnoredDuringExecution node affinity
 	// https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/
 
@@ -85,7 +95,7 @@ func (t *Translator) Process() error {
 		}
 	}
 
-	for _, cm := range t.K8sConfigMpas {
+	for _, cm := range t.K8sConfigMaps {
 		f, err := os.Create(path.Join(t.DestPath, t.getConfigMapFileName(cm.Name)))
 		if err != nil {
 			return err
@@ -168,7 +178,7 @@ func (t *Translator) genDepoyment(logger zerolog.Logger, tg *api.TaskGroup) (*v1
 	// restart
 	if tg.RestartPolicy != nil {
 		t.Notices = append(t.Notices, NoticeItem{
-			Importance: NoticeInformative,
+			Importance: NoticeImportant,
 			Msg:        "the restart policy is not configurable, please review https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#restart-policy",
 		})
 		// logger.Warn().Msg("restart block is not supported")
@@ -374,10 +384,7 @@ func (t *Translator) setTemplates(logger zerolog.Logger, c *corev1.Container, ta
 			logger.Warn().Str("mode", *tpl.ChangeMode).Str("dest", *tpl.DestPath).Msg("only restart/noop change modes are supported. will not handle the change mode for this, need to FIX accordingly")
 		}
 
-		// tpl := template.New(baseDest)
-		// tpl.Mode = parse.SkipFuncCheck
-		// tpl.Parse()
-		tplContent, err := t.evalTemplate(logger, c, tpl)
+		tplContent, isSecret, err := t.evalTemplate(logger, c, tpl)
 		if err != nil {
 			t.Notices = append(t.Notices, NoticeItem{
 				Importance: NoticeBroken,
@@ -388,6 +395,15 @@ func (t *Translator) setTemplates(logger zerolog.Logger, c *corev1.Container, ta
 			continue
 			// return err
 		}
+		if isSecret {
+			t.Notices = append(t.Notices, NoticeItem{
+				Importance: NoticeBroken,
+				Msg:        fmt.Sprintf("template %s of task %s is a secrete type, plz review the translation manually", *tpl.DestPath, task.Name),
+			})
+		}
+
+		// TODO: handle secret as secret
+
 		logger.Debug().Str("content", tplContent).Str("dest", *tpl.DestPath).Msg("rendered default tpl")
 
 		if isEnv {
@@ -400,12 +416,29 @@ func (t *Translator) setTemplates(logger zerolog.Logger, c *corev1.Container, ta
 			//     name: device-state-api-config
 
 			// https://www.baeldung.com/linux/kubernetes-pod-environment-variables#1-order-of-precedence
-			cmName := t.getDefaultConfigMapName(*tpl.DestPath)
-			cm, err := formatEnvvarConfigMap(cmName, tplContent)
-			if err != nil {
-				return err
+
+			cmName := ""
+			unique := false
+			cmIdx := 0
+			for !unique {
+				cmName = t.getDefaultConfigMapName(*tpl.DestPath)
+				if cmIdx != 0 {
+					cmName += strconv.Itoa(cmIdx)
+				}
+				cm, err := formatEnvvarConfigMap(cmName, tplContent)
+				if err != nil {
+					return err
+				}
+
+				if cmExisting, ok := t.K8sConfigMaps[cmName]; ok && !reflect.DeepEqual(cm, cmExisting) {
+					logger.Warn().Str("name", cmName).Msg("configmap clashed")
+					cmIdx++
+				} else {
+					unique = true
+					t.K8sConfigMaps[cmName] = cm
+				}
 			}
-			t.K8sConfigMpas = append(t.K8sConfigMpas, cm)
+
 			c.EnvFrom = append(c.EnvFrom, corev1.EnvFromSource{
 				ConfigMapRef: &corev1.ConfigMapEnvSource{
 					LocalObjectReference: corev1.LocalObjectReference{
@@ -414,13 +447,14 @@ func (t *Translator) setTemplates(logger zerolog.Logger, c *corev1.Container, ta
 				},
 			})
 
-			// TODO: should i create different configMap or the same?
+			// Q: should i create different configMap or the same?
 			// My Answer:
 			// Since for env we are mounting everything, so its better to keep it separate.
 			// but for the volume mounted configMap, we have the option to mount individual files
 			// so there we can create a single configMap and have different inner entries in there.
 
 		} else {
+			logger.Debug().Msg("processing volume template")
 			// handling it as a layer in projected volumes
 			// volumes:
 			// - name: all-in-one
@@ -482,33 +516,33 @@ func (t *Translator) GetNamePrefix() string {
 	return t.NamePrefix
 }
 
-func (t *Translator) evalTemplate(logger zerolog.Logger, c *corev1.Container, nmdTpl *api.Template) (string, error) {
+func (t *Translator) evalTemplate(logger zerolog.Logger, c *corev1.Container, nmdTpl *api.Template) (content string, isSecret bool, err error) {
 	logger = logger.With().Str("dest", *nmdTpl.DestPath).Logger()
 
 	// baseDest := path.Base(*nmdTpl.DestPath)
-	var err error
 
 	tpl := template.New(*nmdTpl.DestPath)
-	tpl.Funcs(stubTplFuncs(logger))
+	tpl.Funcs(stubTplFuncs(logger, &isSecret))
 	tpl, err = tpl.Parse(*nmdTpl.EmbeddedTmpl)
 	if err != nil {
 		logger.Error().Err(err).Msg("failed to parse template")
-		return "", err
+		return "", false, err
 	}
 
 	buf := bytes.Buffer{}
 	err = tpl.Execute(&buf, nil)
 
-	return buf.String(), err
+	return buf.String(), isSecret, err
 }
 
-func stubTplFuncs(logger zerolog.Logger) template.FuncMap {
+func stubTplFuncs(logger zerolog.Logger, isSecret *bool) template.FuncMap {
 	return template.FuncMap{
 		"keyOrDefault": func(s, def string) (string, error) {
 			return def, nil
 		},
 		"secret": func(s ...string) (interface{}, error) {
 			logger.Warn().Msg("secret is not supporetd")
+			*isSecret = true
 			return map[string]interface{}{
 				"Data": map[string]interface{}{
 					// "data": map[string]interface{}{
