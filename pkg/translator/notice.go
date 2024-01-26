@@ -53,7 +53,10 @@ func (ns Notices) String() string {
 
 func (ns Notices) Sort() {
 	slices.SortStableFunc[NoticeItem](ns, func(a, b NoticeItem) bool {
-		return a.Importance < b.Importance
+		if a.Importance != b.Importance {
+			return a.Importance < b.Importance
+		}
+		return a.Msg < b.Msg
 	})
 }
 

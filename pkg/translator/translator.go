@@ -21,7 +21,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
+	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
 const (
@@ -68,13 +69,15 @@ type Translator struct {
 
 	K8sCRs         []interface{}
 	K8sDeployemnts []*v1.Deployment
+
 	// When Generation CMs, the name could collide based on the original nomad template
 	// destination attribute
 	// thus using a map to better test collision than slice
-	K8sConfigMaps  map[string]*corev1.ConfigMap
-	// K8sConfigMpas   []*corev1.ConfigMap
+	K8sConfigMaps map[string]*corev1.ConfigMap
 
 	K8sServices []*corev1.Service
+
+	K8sHTTPRoute []*gwv1.HTTPRoute
 }
 
 // A job in nomad can contain muliple groups. Each group is mapped to a deployment (and a corresponding service)
@@ -111,6 +114,16 @@ func (t *Translator) Process() error {
 			return err
 		}
 		content, _ := yaml.Marshal(srv)
+		_, _ = f.Write(content)
+		f.Close()
+	}
+
+	for _, r := range t.K8sHTTPRoute {
+		f, err := os.Create(path.Join(t.DestPath, t.getRouteFileName(r.Name)))
+		if err != nil {
+			return err
+		}
+		content, _ := yaml.Marshal(r)
 		_, _ = f.Write(content)
 		f.Close()
 	}
@@ -166,7 +179,7 @@ func (t *Translator) genDepoyment(logger zerolog.Logger, tg *api.TaskGroup) (*v1
 	depSepc.Selector = &podTplSelector
 
 	// count
-	depSepc.Replicas = pointer.Int32(int32(*tg.Count))
+	depSepc.Replicas = ptr.To(int32(*tg.Count))
 
 	// scaling
 	if tg.Scaling != nil {
@@ -303,9 +316,74 @@ func (t *Translator) genService(logger zerolog.Logger, tg *api.TaskGroup) error 
 		}
 
 		t.K8sServices = append(t.K8sServices, &k8sSrv)
+
+		t.processSvcTags(logger, tg, srv, &k8sSrv)
 	}
 
 	return nil
+}
+
+func (t *Translator) processSvcTags(logger zerolog.Logger, tg *api.TaskGroup, srv *api.Service, k8sSrv *corev1.Service) {
+	// main point for this is to translate ingress rules to Gateway API resource
+	// e.g: "ingress-/v1/devices"
+
+	if len(srv.Tags) == 0 {
+		return
+	}
+
+	var pathPrefixes []string
+	for _, tag := range srv.Tags {
+		if strings.HasPrefix(tag, "ingress-/") {
+			pathPrefix := tag[8:]
+			logger.Debug().Str("pathprefix", pathPrefix).Msg("gen httproute for service")
+			pathPrefixes = append(pathPrefixes, pathPrefix)
+		}
+	}
+
+	if len(pathPrefixes) == 0 {
+		return
+	}
+
+	httpRoute := gwv1.HTTPRoute{}
+	httpRoute.APIVersion = "gateway.networking.k8s.io/v1beta1"
+	httpRoute.Kind = "HTTPRoute"
+	httpRoute.Name = srv.Name
+	httpRoute.Spec.ParentRefs = []gwv1.ParentReference{
+		{
+			Namespace: (*gwv1.Namespace)(ptr.To("{{ gateway_namespace }}")),
+			Name:      "{{ gateway_name }}",
+		},
+	}
+	matchers := make([]gwv1.HTTPRouteMatch, 0, len(pathPrefixes))
+	for _, prefix := range pathPrefixes {
+		matchers = append(matchers, gwv1.HTTPRouteMatch{
+			Path: &gwv1.HTTPPathMatch{
+				Type:  ptr.To(gwv1.PathMatchPathPrefix),
+				Value: ptr.To(prefix),
+			},
+		})
+	}
+	httpRoute.Spec.Rules = append(httpRoute.Spec.Rules, gwv1.HTTPRouteRule{
+		Matches: matchers,
+		BackendRefs: []gwv1.HTTPBackendRef{
+			{
+				BackendRef: gwv1.BackendRef{
+					BackendObjectReference: gwv1.BackendObjectReference{
+						Name:      gwv1.ObjectName(k8sSrv.Name),
+						Port:      (*gwv1.PortNumber)(&k8sSrv.Spec.Ports[0].Port),
+						Namespace: (*gwv1.Namespace)(ptr.To("{{ namespace }}")),
+					},
+				},
+			},
+		},
+	})
+
+	t.K8sHTTPRoute = append(t.K8sHTTPRoute, &httpRoute)
+
+	t.Notices = append(t.Notices, NoticeItem{
+		Importance: NoticeImportant,
+		Msg:        "review all HTTPRoute resources to fix the gateway info, and service namespace",
+	})
 }
 
 func logUnspportedPortUsage(logger zerolog.Logger, resvPort []api.Port, dynPort []api.Port) {
@@ -480,6 +558,14 @@ func (t *Translator) getServiceFileName(name string) string {
 		name = prefix + name
 	}
 	return name + "-service.yml"
+}
+
+func (t *Translator) getRouteFileName(name string) string {
+	prefix := t.GetNamePrefix()
+	if !strings.HasPrefix(name, prefix) {
+		name = prefix + name
+	}
+	return name + "-route.yml"
 }
 
 func (t *Translator) getConfigMapFileName(name string) string {
