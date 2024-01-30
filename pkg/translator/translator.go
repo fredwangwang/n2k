@@ -7,6 +7,7 @@ import (
 	"path"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"text/template"
@@ -75,6 +76,8 @@ type Translator struct {
 	// thus using a map to better test collision than slice
 	K8sConfigMaps map[string]*corev1.ConfigMap
 
+	K8sSecret map[string]*corev1.Secret
+
 	K8sServices []*corev1.Service
 
 	K8sHTTPRoute []*gwv1.HTTPRoute
@@ -85,6 +88,9 @@ type Translator struct {
 func (t *Translator) Process() error {
 	if t.K8sConfigMaps == nil {
 		t.K8sConfigMaps = make(map[string]*corev1.ConfigMap)
+	}
+	if t.K8sSecret == nil {
+		t.K8sSecret = make(map[string]*corev1.Secret)
 	}
 
 	// TODO t.Job.Affinities to preferredDuringSchedulingIgnoredDuringExecution node affinity
@@ -104,6 +110,16 @@ func (t *Translator) Process() error {
 			return err
 		}
 		content, _ := yaml.Marshal(cm)
+		_, _ = f.Write(content)
+		f.Close()
+	}
+
+	for _, sec := range t.K8sSecret {
+		f, err := os.Create(path.Join(t.DestPath, t.getSecretFileName(sec.Name)))
+		if err != nil {
+			return err
+		}
+		content, _ := yaml.Marshal(sec)
 		_, _ = f.Write(content)
 		f.Close()
 	}
@@ -191,7 +207,7 @@ func (t *Translator) genDepoyment(logger zerolog.Logger, tg *api.TaskGroup) (*v1
 	// restart
 	if tg.RestartPolicy != nil {
 		t.Notices = append(t.Notices, NoticeItem{
-			Importance: NoticeImportant,
+			Importance: NoticeInformative,
 			Msg:        "the restart policy is not configurable, please review https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#restart-policy",
 		})
 		// logger.Warn().Msg("restart block is not supported")
@@ -236,6 +252,7 @@ func (t *Translator) genDepoyment(logger zerolog.Logger, tg *api.TaskGroup) (*v1
 	podSpec := corev1.PodSpec{}
 
 	for _, task := range tg.Tasks {
+		logger = logger.With().Str("task", task.Name).Logger()
 		// TODO check all members of task
 		// https://developer.hashicorp.com/nomad/docs/job-specification/task
 		c := corev1.Container{}
@@ -247,14 +264,14 @@ func (t *Translator) genDepoyment(logger zerolog.Logger, tg *api.TaskGroup) (*v1
 		}
 
 		c.Name = task.Name
-		c.Env = genEnv(logger, task.Env)
+		c.Env = t.genEnv(logger, task.Env)
 
 		// logs
 		// TODO: is it able to be handled? maybe not
 		// https://kubernetes.io/docs/concepts/cluster-administration/logging/#log-rotation
 
 		// template
-		err := t.setTemplates(logger, &c, task)
+		err := t.setTemplates(logger, &c, &podSpec, task)
 		if err != nil {
 			return nil, err
 		}
@@ -264,7 +281,7 @@ func (t *Translator) genDepoyment(logger zerolog.Logger, tg *api.TaskGroup) (*v1
 		delete(task.Config, "cpu_hard_limit")
 
 		if len(task.Config) != 0 {
-			logger.Warn().Str("task", task.Name).Any("config", task.Config).Msg("unsupported fields in config")
+			logger.Warn().Any("config", task.Config).Msg("unsupported fields in config")
 		}
 		podSpec.Containers = append(podSpec.Containers, c)
 	}
@@ -284,7 +301,7 @@ func (t *Translator) genService(logger zerolog.Logger, tg *api.TaskGroup) error 
 	}
 
 	for _, srv := range tg.Services {
-		logger = logger.With().Str("name", srv.Name).Logger()
+		logger = logger.With().Str("service", srv.Name).Logger()
 
 		k8sSrv := corev1.Service{}
 		k8sSrv.APIVersion = "v1"
@@ -317,13 +334,13 @@ func (t *Translator) genService(logger zerolog.Logger, tg *api.TaskGroup) error 
 
 		t.K8sServices = append(t.K8sServices, &k8sSrv)
 
-		t.processSvcTags(logger, tg, srv, &k8sSrv)
+		t.genHttpRoute(logger, tg, srv, &k8sSrv)
 	}
 
 	return nil
 }
 
-func (t *Translator) processSvcTags(logger zerolog.Logger, tg *api.TaskGroup, srv *api.Service, k8sSrv *corev1.Service) {
+func (t *Translator) genHttpRoute(logger zerolog.Logger, tg *api.TaskGroup, srv *api.Service, k8sSrv *corev1.Service) {
 	// main point for this is to translate ingress rules to Gateway API resource
 	// e.g: "ingress-/v1/devices"
 
@@ -334,6 +351,12 @@ func (t *Translator) processSvcTags(logger zerolog.Logger, tg *api.TaskGroup, sr
 	var pathPrefixes []string
 	for _, tag := range srv.Tags {
 		if strings.HasPrefix(tag, "ingress-/") {
+			if strings.HasSuffix(tag, "/hc") {
+				// these are the health check endpoints.. ignore them
+				logger.Debug().Str("tag", tag).Msg("ignoring route gen for health check endpoints")
+				continue
+			}
+
 			pathPrefix := tag[8:]
 			logger.Debug().Str("pathprefix", pathPrefix).Msg("gen httproute for service")
 			pathPrefixes = append(pathPrefixes, pathPrefix)
@@ -400,24 +423,63 @@ func logUnspportedPortUsage(logger zerolog.Logger, resvPort []api.Port, dynPort 
 	}
 }
 
-func genEnv(logger zerolog.Logger, env map[string]string) []corev1.EnvVar {
-	res := make([]corev1.EnvVar, 0, len(env))
+var nomadVarRe = regexp.MustCompile(`\$\{.*\}`)
 
-	// TODO: process some of the env vars in reasonable ways
-	// things such as meta.unique.host_ip..
-	for k, v := range env {
+func (t *Translator) genEnv(logger zerolog.Logger, envs map[string]string) []corev1.EnvVar {
+	downardApiMap := map[string]string{}
+
+	res := make([]corev1.EnvVar, 0, len(envs))
+
+	for k, v := range envs {
+		orik := k
 		k := k
 		v := v
 		if strings.Contains(k, ":") {
-			orik := k
 			k = strings.ReplaceAll(k, ":", "__")
 			logger.Info().Str("old", orik).Str("new", k).Msg("env var with : not allowed, renaming")
 		}
 
-		res = append(res, corev1.EnvVar{
+		env := corev1.EnvVar{
 			Name:  k,
 			Value: v,
-		})
+		}
+
+		matched := nomadVarRe.FindStringSubmatch(v)
+		if len(matched) > 0 {
+			// this uses some of the nomad runtime variables: https://developer.hashicorp.com/nomad/docs/runtime/interpolation
+			// change it to K8s downward api: https://kubernetes.io/docs/concepts/workloads/pods/downward-api/
+			// and composes env var: https://kubernetes.io/docs/tasks/inject-data-application/define-interdependent-environment-variables/
+
+			for _, nomadVWithDollar := range matched {
+				nomadV := nomadVWithDollar[2 : len(nomadVWithDollar)-1]
+
+				envVarName, ok := downardApiMap[nomadV]
+				if !ok {
+					dav, mapped := nomadVarToDownardApiVar(logger, nomadV)
+					downardApiMap[nomadV] = dav.Name
+					envVarName = dav.Name // assign the generated envvar name, could be empty if mapping failed.
+
+					if mapped {
+						res = append(res, dav)
+					}
+				}
+
+				if envVarName == "" {
+					t.Notices = append(t.Notices, NoticeItem{
+						Importance: NoticeImportant,
+						Msg:        fmt.Sprintf("env \"%s\" uses %s which is not supported in downward api", orik, nomadVWithDollar),
+					})
+
+					// there is no point of further substitute if some of the variable cannot be channged to downward api
+					goto afterSubstitute
+				}
+
+				env.Value = strings.ReplaceAll(env.Value, nomadVWithDollar, "$("+envVarName+")")
+			}
+		}
+
+	afterSubstitute:
+		res = append(res, env)
 	}
 
 	return res
@@ -446,20 +508,23 @@ func setArgs(c *corev1.Container, config map[string]interface{}) {
 	delete(config, "args")
 }
 
-func (t *Translator) setTemplates(logger zerolog.Logger, c *corev1.Container, task *api.Task) error {
+func (t *Translator) setTemplates(logger zerolog.Logger, c *corev1.Container, podSpec *corev1.PodSpec, task *api.Task) error {
+	mountedPaths := map[string]*corev1.Volume{}
+
 	for _, tpl := range task.Templates {
+		logger = logger.With().Str("dest", *tpl.DestPath).Logger()
 		changeModeIsRestart := tpl.ChangeMode == nil || *tpl.ChangeMode == "restart"
 		changeModeIsNoop := tpl.ChangeMode != nil && *tpl.ChangeMode == "noop"
 		isEnv := tpl.Envvars != nil && *tpl.Envvars
 		// baseDest := path.Base(*tpl.DestPath)
 
 		if tpl.EmbeddedTmpl == nil {
-			logger.Warn().Str("source", *tpl.SourcePath).Str("dest", *tpl.DestPath).Msg("only embedded data is supported, tpl from remote source ignored")
+			logger.Warn().Str("source", *tpl.SourcePath).Msg("only embedded data is supported, tpl from remote source ignored")
 			continue
 		}
 
 		if !changeModeIsRestart && !changeModeIsNoop {
-			logger.Warn().Str("mode", *tpl.ChangeMode).Str("dest", *tpl.DestPath).Msg("only restart/noop change modes are supported. will not handle the change mode for this, need to FIX accordingly")
+			logger.Warn().Str("mode", *tpl.ChangeMode).Msg("only restart/noop change modes are supported. will not handle the change mode for this, need to FIX accordingly")
 		}
 
 		tplContent, isSecret, err := t.evalTemplate(logger, c, tpl)
@@ -468,21 +533,16 @@ func (t *Translator) setTemplates(logger zerolog.Logger, c *corev1.Container, ta
 				Importance: NoticeBroken,
 				Msg:        fmt.Sprintf("template %s of task %s is not parsable, plz review the translation manually", *tpl.DestPath, task.Name),
 			})
-			// TODO: how to best handle unparsable?
 			logger.Error().Err(err).Msg("parsing failed")
 			continue
-			// return err
 		}
 		if isSecret {
 			t.Notices = append(t.Notices, NoticeItem{
 				Importance: NoticeBroken,
-				Msg:        fmt.Sprintf("template %s of task %s is a secrete type, plz review the translation manually", *tpl.DestPath, task.Name),
+				Msg:        "plz review ALL secrete type resources, translation is incomplete.",
+				// Msg:        fmt.Sprintf("template %s of task %s is a secrete type, plz review the translation manually", *tpl.DestPath, task.Name),
 			})
 		}
-
-		// TODO: handle secret as secret
-
-		logger.Debug().Str("content", tplContent).Str("dest", *tpl.DestPath).Msg("rendered default tpl")
 
 		if isEnv {
 			logger.Debug().Msg("processing env template")
@@ -499,38 +559,64 @@ func (t *Translator) setTemplates(logger zerolog.Logger, c *corev1.Container, ta
 			unique := false
 			cmIdx := 0
 			for !unique {
-				cmName = t.getDefaultConfigMapName(*tpl.DestPath)
-				if cmIdx != 0 {
-					cmName += strconv.Itoa(cmIdx)
-				}
-				cm, err := formatEnvvarConfigMap(cmName, tplContent)
-				if err != nil {
-					return err
-				}
+				if !isSecret {
+					cmName = t.getDefaultConfigMapName(*tpl.DestPath, cmIdx)
+					cm, err := formatEnvvarConfigMap(logger, cmName, tplContent)
+					if err != nil {
+						return err
+					}
 
-				if cmExisting, ok := t.K8sConfigMaps[cmName]; ok && !reflect.DeepEqual(cm, cmExisting) {
-					logger.Warn().Str("name", cmName).Msg("configmap clashed")
-					cmIdx++
+					if cmExisting, ok := t.K8sConfigMaps[cmName]; ok && !reflect.DeepEqual(cm, cmExisting) {
+						logger.Debug().Str("name", cmName).Msg("configmap name clashed, try next...")
+						cmIdx++
+					} else {
+						unique = true
+						t.K8sConfigMaps[cmName] = cm
+					}
 				} else {
-					unique = true
-					t.K8sConfigMaps[cmName] = cm
+					// dont use the default name for secret, the secret is not supposed to be
+					// overlay'd
+					cmName = t.getConfigMapName(*tpl.DestPath, cmIdx)
+					cm, err := formatEnvvarSecret(logger, cmName, tplContent)
+					if err != nil {
+						return err
+					}
+
+					if cmExisting, ok := t.K8sSecret[cmName]; ok && !reflect.DeepEqual(cm, cmExisting) {
+						logger.Debug().Str("name", cmName).Msg("configmap name clashed, try next...")
+						cmIdx++
+					} else {
+						unique = true
+						t.K8sSecret[cmName] = cm
+					}
 				}
 			}
 
-			c.EnvFrom = append(c.EnvFrom, corev1.EnvFromSource{
-				ConfigMapRef: &corev1.ConfigMapEnvSource{
-					LocalObjectReference: corev1.LocalObjectReference{
-						Name: cmName,
+			if !isSecret {
+				c.EnvFrom = append(c.EnvFrom, corev1.EnvFromSource{
+					ConfigMapRef: &corev1.ConfigMapEnvSource{
+						LocalObjectReference: corev1.LocalObjectReference{
+							Name: cmName,
+						},
 					},
-				},
-			})
-
-			// Q: should i create different configMap or the same?
-			// My Answer:
-			// Since for env we are mounting everything, so its better to keep it separate.
-			// but for the volume mounted configMap, we have the option to mount individual files
-			// so there we can create a single configMap and have different inner entries in there.
-
+				})
+				c.EnvFrom = append(c.EnvFrom, corev1.EnvFromSource{
+					ConfigMapRef: &corev1.ConfigMapEnvSource{
+						LocalObjectReference: corev1.LocalObjectReference{
+							Name: t.getConfigMapName(*tpl.DestPath, cmIdx),
+						},
+						Optional: ptr.To(true),
+					},
+				})
+			} else {
+				c.EnvFrom = append(c.EnvFrom, corev1.EnvFromSource{
+					SecretRef: &corev1.SecretEnvSource{
+						LocalObjectReference: corev1.LocalObjectReference{
+							Name: t.getConfigMapName(*tpl.DestPath, cmIdx),
+						},
+					},
+				})
+			}
 		} else {
 			logger.Debug().Msg("processing volume template")
 			// handling it as a layer in projected volumes
@@ -545,7 +631,76 @@ func (t *Translator) setTemplates(logger zerolog.Logger, c *corev1.Container, ta
 			// 	 	optional: true
 
 			// https://kubernetes.io/docs/concepts/storage/projected-volumes/
-			// TODO: handle volumes
+
+			cmName := ""
+			unique := false
+			cmIdx := 0
+			for !unique {
+				if !isSecret {
+					cmName = t.getDefaultConfigMapName(*tpl.DestPath, cmIdx)
+					cm, err := formatVolumeConfigMap(logger, cmName, tplContent, *tpl.DestPath)
+					if err != nil {
+						return err
+					}
+
+					if cmExisting, ok := t.K8sConfigMaps[cmName]; ok && !reflect.DeepEqual(cm, cmExisting) {
+						logger.Debug().Str("name", cmName).Msg("configmap name clashed, try next...")
+						cmIdx++
+					} else {
+						unique = true
+						t.K8sConfigMaps[cmName] = cm
+					}
+				} else {
+					// dont use the default name for secret, the secret is not supposed to be
+					// overlay'd
+					cmName = t.getConfigMapName(*tpl.DestPath, cmIdx)
+					cm, err := formatVolumeSecret(logger, cmName, tplContent, *tpl.DestPath)
+					if err != nil {
+						return err
+					}
+
+					if cmExisting, ok := t.K8sSecret[cmName]; ok && !reflect.DeepEqual(cm, cmExisting) {
+						logger.Debug().Str("name", cmName).Msg("configmap name clashed, try next...")
+						cmIdx++
+					} else {
+						unique = true
+						t.K8sSecret[cmName] = cm
+					}
+				}
+			}
+
+			mountPath := getMountPath(*tpl.DestPath)
+			var volRef *corev1.Volume
+			if vol, ok := mountedPaths[mountPath]; ok {
+				volRef = vol
+			} else {
+				volName := task.Name + strings.ReplaceAll(mountPath, "/", "-")
+
+				volRef = &corev1.Volume{
+					Name: volName,
+					VolumeSource: corev1.VolumeSource{
+						Projected: &corev1.ProjectedVolumeSource{},
+					},
+				}
+
+				mountedPaths[mountPath] = volRef
+
+				c.VolumeMounts = append(c.VolumeMounts, corev1.VolumeMount{
+					Name:      volName,
+					MountPath: mountPath,
+				})
+			}
+
+			if !isSecret {
+				volRef.Projected.Sources = append(volRef.Projected.Sources, getVolumeProjectionRef(false, cmName, false))
+				volRef.Projected.Sources = append(volRef.Projected.Sources, getVolumeProjectionRef(false, t.getConfigMapName(*tpl.DestPath, cmIdx), true))
+			} else {
+				volRef.Projected.Sources = append(volRef.Projected.Sources, getVolumeProjectionRef(true, t.getConfigMapName(*tpl.DestPath, cmIdx), false))
+			}
+		}
+
+		for _, vol := range mountedPaths {
+			podSpec.Volumes = append(podSpec.Volumes, *vol)
 		}
 	}
 
@@ -574,6 +729,14 @@ func (t *Translator) getConfigMapFileName(name string) string {
 		name = prefix + name
 	}
 	return name + "-config-map.yml"
+}
+
+func (t *Translator) getSecretFileName(name string) string {
+	prefix := t.GetNamePrefix()
+	if !strings.HasPrefix(name, prefix) {
+		name = prefix + name
+	}
+	return name + "-secret.yml"
 }
 
 func (t *Translator) getDeploymentFilename(name string) string {
@@ -640,16 +803,46 @@ func stubTplFuncs(logger zerolog.Logger, isSecret *bool) template.FuncMap {
 	}
 }
 
-func (t *Translator) getConfigMapName(name string) string {
+func (t *Translator) getConfigMapName(name string, idx int) string {
 	basename := t.GetNamePrefix() + "-" + strings.ReplaceAll(name, "/", "-")
+	basename = strings.TrimSuffix(basename, filepath.Ext(basename))
+	if idx != 0 {
+		return basename + strconv.Itoa(idx)
+	}
 	return strings.TrimSuffix(basename, filepath.Ext(basename))
 }
 
-func (t *Translator) getDefaultConfigMapName(name string) string {
-	return t.getConfigMapName(name) + "-default"
+func (t *Translator) getDefaultConfigMapName(name string, idx int) string {
+	return t.getConfigMapName(name, idx) + "-default"
 }
 
-func formatEnvvarConfigMap(name, content string) (*corev1.ConfigMap, error) {
+func formatVolumeConfigMap(logger zerolog.Logger, name, content, destPath string) (*corev1.ConfigMap, error) {
+	res := corev1.ConfigMap{}
+	res.Name = name
+	res.APIVersion = "v1"
+	res.Kind = "ConfigMap"
+
+	res.Data = map[string]string{
+		filepath.Base(destPath): content,
+	}
+
+	return &res, nil
+}
+
+func formatVolumeSecret(logger zerolog.Logger, name, content, destPath string) (*corev1.Secret, error) {
+	res := corev1.Secret{}
+	res.Name = name
+	res.APIVersion = "v1"
+	res.Kind = "Secret"
+
+	res.StringData = map[string]string{
+		filepath.Base(destPath): content,
+	}
+
+	return &res, nil
+}
+
+func formatEnvvarConfigMap(logger zerolog.Logger, name, content string) (*corev1.ConfigMap, error) {
 	res := corev1.ConfigMap{}
 	res.Name = name
 	res.APIVersion = "v1"
@@ -664,10 +857,33 @@ func formatEnvvarConfigMap(name, content string) (*corev1.ConfigMap, error) {
 		}
 		idx := strings.Index(l, "=")
 		if idx == -1 {
-			// TODO: add log
+			logger.Error().Str("line", l).Msg("malformated")
 			return nil, errors.New("malformated line")
 		}
 		res.Data[l[:idx]] = l[idx+1:]
+	}
+	return &res, nil
+}
+
+func formatEnvvarSecret(logger zerolog.Logger, name, content string) (*corev1.Secret, error) {
+	res := corev1.Secret{}
+	res.Name = name
+	res.APIVersion = "v1"
+	res.Kind = "Secret"
+
+	res.StringData = map[string]string{}
+
+	for _, l := range strings.Split(content, "\n") {
+		l = strings.TrimSpace(l)
+		if l == "" {
+			continue
+		}
+		idx := strings.Index(l, "=")
+		if idx == -1 {
+			logger.Error().Str("line", l).Msg("malformated")
+			return nil, errors.New("malformated line")
+		}
+		res.StringData[l[:idx]] = l[idx+1:]
 	}
 	return &res, nil
 }
@@ -676,4 +892,60 @@ func genPodSelector(tg *api.TaskGroup) map[string]string {
 	return map[string]string{
 		"app": *tg.Name,
 	}
+}
+
+func getMountPath(path string) string {
+	return filepath.Dir("/" + path)
+}
+
+func getVolumeProjectionRef(isSecret bool, name string, optional bool) corev1.VolumeProjection {
+	if isSecret {
+		return corev1.VolumeProjection{
+			Secret: &corev1.SecretProjection{
+				LocalObjectReference: corev1.LocalObjectReference{
+					Name: name,
+				},
+				Optional: &optional,
+			},
+		}
+	}
+
+	return corev1.VolumeProjection{
+		ConfigMap: &corev1.ConfigMapProjection{
+			LocalObjectReference: corev1.LocalObjectReference{
+				Name: name,
+			},
+			Optional: &optional,
+		},
+	}
+}
+
+func nomadVarToDownardApiVar(logger zerolog.Logger, v string) (corev1.EnvVar, bool) {
+	switch v {
+	case "attr.unique.network.ip-address":
+		return corev1.EnvVar{
+			Name: nomadVarToEnvvarName(v),
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{
+					FieldPath: "status.hostIP",
+				},
+			},
+		}, true
+	case "attr.unique.hostname":
+		return corev1.EnvVar{
+			Name: nomadVarToEnvvarName(v),
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{
+					FieldPath: "spec.nodeName",
+				},
+			},
+		}, true
+	default:
+		logger.Warn().Str("var", v).Msg("failed to find corresponding downward api")
+		return corev1.EnvVar{}, false
+	}
+}
+
+func nomadVarToEnvvarName(k string) string {
+	return strings.ReplaceAll(strings.ReplaceAll(k, ".", "_"), "-", "_")
 }

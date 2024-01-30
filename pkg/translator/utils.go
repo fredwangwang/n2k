@@ -11,3 +11,10 @@ func AppendIfNotNil[T any](arr []T, v T) []T {
 
 	return append(arr, v)
 }
+
+func AbbrevStr(in string, length int) string {
+	if len(in) < length {
+		return in
+	}
+	return in[:length] + "..."
+}
