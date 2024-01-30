@@ -842,50 +842,46 @@ func formatVolumeSecret(logger zerolog.Logger, name, content, destPath string) (
 	return &res, nil
 }
 
+func tplContentToEnvvar(logger zerolog.Logger, content string) (map[string]string, error) {
+	res := map[string]string{}
+
+	for _, l := range strings.Split(content, "\n") {
+		l = strings.TrimSpace(l)
+		if l == "" {
+			continue
+		}
+		idx := strings.Index(l, "=")
+		if idx == -1 {
+			logger.Error().Str("line", l).Msg("malformated")
+			return nil, errors.New("malformated line")
+		}
+		res[l[:idx]] = l[idx+1:]
+	}
+	return res, nil
+}
+
 func formatEnvvarConfigMap(logger zerolog.Logger, name, content string) (*corev1.ConfigMap, error) {
+	var err error
+
 	res := corev1.ConfigMap{}
 	res.Name = name
 	res.APIVersion = "v1"
 	res.Kind = "ConfigMap"
 
-	res.Data = map[string]string{}
-
-	for _, l := range strings.Split(content, "\n") {
-		l = strings.TrimSpace(l)
-		if l == "" {
-			continue
-		}
-		idx := strings.Index(l, "=")
-		if idx == -1 {
-			logger.Error().Str("line", l).Msg("malformated")
-			return nil, errors.New("malformated line")
-		}
-		res.Data[l[:idx]] = l[idx+1:]
-	}
-	return &res, nil
+	res.Data, err = tplContentToEnvvar(logger, content)
+	return &res, err
 }
 
 func formatEnvvarSecret(logger zerolog.Logger, name, content string) (*corev1.Secret, error) {
+	var err error
+
 	res := corev1.Secret{}
 	res.Name = name
 	res.APIVersion = "v1"
 	res.Kind = "Secret"
 
-	res.StringData = map[string]string{}
-
-	for _, l := range strings.Split(content, "\n") {
-		l = strings.TrimSpace(l)
-		if l == "" {
-			continue
-		}
-		idx := strings.Index(l, "=")
-		if idx == -1 {
-			logger.Error().Str("line", l).Msg("malformated")
-			return nil, errors.New("malformated line")
-		}
-		res.StringData[l[:idx]] = l[idx+1:]
-	}
-	return &res, nil
+	res.StringData, err = tplContentToEnvvar(logger, content)
+	return &res, err
 }
 
 func genPodSelector(tg *api.TaskGroup) map[string]string {
