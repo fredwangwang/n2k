@@ -29,7 +29,9 @@ import (
 )
 
 const (
-	DefaultChangeMode = "restart"
+	DefaultChangeMode              = "restart"
+	ReloaderConfigMapAnnotationKey = "configmap.reloader.stakater.com/reload"
+	ReloaderSecretAnnotationKey    = "secret.reloader.stakater.com/reload"
 )
 
 var (
@@ -209,6 +211,7 @@ func (t *Translator) genDepoyment(logger zerolog.Logger, tg *api.TaskGroup) (*v1
 	dep := v1.Deployment{}
 	dep.APIVersion = "apps/v1"
 	dep.Kind = "Deployment"
+	dep.Labels = make(map[string]string)
 
 	dep.SetName(*tg.Name)
 
@@ -297,10 +300,13 @@ func (t *Translator) genDepoyment(logger zerolog.Logger, tg *api.TaskGroup) (*v1
 		// https://kubernetes.io/docs/concepts/cluster-administration/logging/#log-rotation
 
 		// template
-		err := t.setTemplates(logger, &c, &podSpec, task)
+		cmReloaderTags, secretReloaderTags, err := t.setTemplates(logger, &c, &podSpec, task)
 		if err != nil {
 			return nil, err
 		}
+
+		dep.Labels[ReloaderConfigMapAnnotationKey] = cmReloaderTags
+		dep.Labels[ReloaderSecretAnnotationKey] = secretReloaderTags
 
 		setImage(&c, task.Config)
 		setArgs(&c, task.Config)
@@ -557,7 +563,10 @@ func setArgs(c *corev1.Container, config map[string]interface{}) {
 	delete(config, "args")
 }
 
-func (t *Translator) setTemplates(logger zerolog.Logger, c *corev1.Container, podSpec *corev1.PodSpec, task *api.Task) error {
+func (t *Translator) setTemplates(logger zerolog.Logger, c *corev1.Container, podSpec *corev1.PodSpec, task *api.Task) (cmReloaderTagVal string, secretReloaderTagVal string, err error) {
+	var cmReloaderTags []string
+	var secretReloaderTags []string
+
 	mountedPaths := map[string]*corev1.Volume{}
 
 	for _, tpl := range task.Templates {
@@ -612,7 +621,7 @@ func (t *Translator) setTemplates(logger zerolog.Logger, c *corev1.Container, po
 					cmName = t.getDefaultConfigMapName(*tpl.DestPath, cmIdx)
 					cm, err := formatEnvvarConfigMap(logger, cmName, tplContent)
 					if err != nil {
-						return err
+						return "", "", err
 					}
 
 					if cmExisting, ok := t.K8sConfigMaps[cmName]; ok && !reflect.DeepEqual(cm, cmExisting) {
@@ -628,7 +637,7 @@ func (t *Translator) setTemplates(logger zerolog.Logger, c *corev1.Container, po
 					cmName = t.getConfigMapName(*tpl.DestPath, cmIdx)
 					cm, err := formatEnvvarSecret(logger, cmName, tplContent)
 					if err != nil {
-						return err
+						return "", "", err
 					}
 
 					if cmExisting, ok := t.K8sSecret[cmName]; ok && !reflect.DeepEqual(cm, cmExisting) {
@@ -661,6 +670,9 @@ func (t *Translator) setTemplates(logger zerolog.Logger, c *corev1.Container, po
 						Optional: ptr.To(true),
 					},
 				})
+
+				// for configMap only reload the optional one.
+				cmReloaderTags = append(cmReloaderTags, t.getConfigMapName(*tpl.DestPath, cmIdx))
 			} else {
 				c.EnvFrom = append(c.EnvFrom, corev1.EnvFromSource{
 					SecretRef: &corev1.SecretEnvSource{
@@ -669,6 +681,8 @@ func (t *Translator) setTemplates(logger zerolog.Logger, c *corev1.Container, po
 						},
 					},
 				})
+
+				secretReloaderTags = append(secretReloaderTags, t.getConfigMapName(*tpl.DestPath, cmIdx))
 			}
 		} else {
 			logger.Debug().Msg("processing volume template")
@@ -693,7 +707,7 @@ func (t *Translator) setTemplates(logger zerolog.Logger, c *corev1.Container, po
 					cmName = t.getDefaultConfigMapName(*tpl.DestPath, cmIdx)
 					cm, err := formatVolumeConfigMap(logger, cmName, tplContent, *tpl.DestPath)
 					if err != nil {
-						return err
+						return "", "", err
 					}
 
 					if cmExisting, ok := t.K8sConfigMaps[cmName]; ok && !reflect.DeepEqual(cm, cmExisting) {
@@ -709,7 +723,7 @@ func (t *Translator) setTemplates(logger zerolog.Logger, c *corev1.Container, po
 					cmName = t.getConfigMapName(*tpl.DestPath, cmIdx)
 					cm, err := formatVolumeSecret(logger, cmName, tplContent, *tpl.DestPath)
 					if err != nil {
-						return err
+						return "", "", err
 					}
 
 					if cmExisting, ok := t.K8sSecret[cmName]; ok && !reflect.DeepEqual(cm, cmExisting) {
@@ -752,8 +766,12 @@ func (t *Translator) setTemplates(logger zerolog.Logger, c *corev1.Container, po
 			if !isSecret {
 				volRef.Projected.Sources = append(volRef.Projected.Sources, getVolumeProjectionRef(false, cmName, false))
 				volRef.Projected.Sources = append(volRef.Projected.Sources, getVolumeProjectionRef(false, t.getConfigMapName(*tpl.DestPath, cmIdx), true))
+
+				cmReloaderTags = append(cmReloaderTags, t.getConfigMapName(*tpl.DestPath, cmIdx))
 			} else {
 				volRef.Projected.Sources = append(volRef.Projected.Sources, getVolumeProjectionRef(true, t.getConfigMapName(*tpl.DestPath, cmIdx), false))
+
+				secretReloaderTags = append(secretReloaderTags, t.getConfigMapName(*tpl.DestPath, cmIdx))
 			}
 		}
 	}
@@ -762,7 +780,7 @@ func (t *Translator) setTemplates(logger zerolog.Logger, c *corev1.Container, po
 		podSpec.Volumes = append(podSpec.Volumes, *vol)
 	}
 
-	return nil
+	return strings.Join(cmReloaderTags, ","), strings.Join(secretReloaderTags, ","), nil
 }
 
 func (t *Translator) translateSecretUsingOpenAI(logger zerolog.Logger, isEnv bool, tpl *api.Template, cmName string) *vsov1.VaultStaticSecret {
@@ -910,6 +928,7 @@ func (t *Translator) stubTplFuncs(logger zerolog.Logger, tpl *api.Template, isSe
 	}
 }
 
+// getConfigMapName gets the resource name for both configmap and secret
 func (t *Translator) getConfigMapName(name string, idx int) string {
 	basename := t.GetNamePrefix() + "-" + strings.ReplaceAll(name, "/", "-")
 	basename = strings.TrimSuffix(basename, filepath.Ext(basename))
