@@ -1,0 +1,16 @@
+Now transform the below source template to destination format:
+```
+ACTUAL_TEMPLATE_PLACEHOLDER
+```
+
+MUST answer it in the below structured yaml format without anything else. The result section must be a valid `VaultStaticSecret` struct, and the output must be a valid yaml.
+
+```
+result: # VaultStaticSecret - the result of the transformation
+  apiVersion: "secrets.hashicorp.com/v1beta1"
+  kind: VaultStaticSecret
+  ......
+confidence: # int - how sure the transformation is, score from 0 to 10
+explanation: | # string - explanation to how the transformation is performed. If there are any ambiguities, also explain here. Keep it concise.
+  details here...
+```

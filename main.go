@@ -3,17 +3,20 @@ package main
 import (
 	"os"
 	"path"
+	"strings"
 
 	"github.com/fredwangwang/n2k/pkg/translator"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 
+	"github.com/hashicorp/nomad/api"
 	"github.com/hashicorp/nomad/command"
 )
 
 const OutputPrefix = "generated-k8s"
 
 func main() {
+	log.Logger = log.Level(zerolog.DebugLevel)
 	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
 
 	jobGetter := command.JobGetter{}
@@ -32,6 +35,19 @@ func main() {
 		log.Error().Str("type", *job.Type).Msg("unexpcted job type, only service type is supported")
 		os.Exit(1)
 	}
+
+	StripLoggingAndMetricsSidecar(job)
+
+	// for _, tg := range job.TaskGroups {
+	// 	for _, task := range tg.Tasks {
+	// 		for _, tpl := range task.Templates {
+	// 			if strings.Contains(*tpl.EmbeddedTmpl, "secret") && (tpl.Envvars == nil || !*tpl.Envvars) {
+	// 				fmt.Printf("%s %s:\n%s\n\n", task.Name, *tpl.DestPath, *tpl.EmbeddedTmpl)
+	// 			}
+	// 		}
+	// 	}
+	// }
+	// os.Exit(0)
 
 	outputPath := path.Join(OutputPrefix, *job.Name)
 	_, err = os.Stat(outputPath)
@@ -55,6 +71,24 @@ func main() {
 	// dep := translator.ToDeployment(job.TaskGroups[0], Namespace)
 
 	// json.NewEncoder(os.Stdout).Encode(dep)
+}
+
+func StripLoggingAndMetricsSidecar(job *api.Job) {
+	for _, tg := range job.TaskGroups {
+		var resTasks []*api.Task
+		for _, task := range tg.Tasks {
+			if strings.Contains(task.Name, "logging") {
+				log.Info().Str("group", *tg.Name).Str("task", task.Name).Msg("removing logging sidecar")
+				continue
+			}
+			if strings.Contains(task.Name, "telegraf") {
+				log.Info().Str("group", *tg.Name).Str("task", task.Name).Msg("removing metrics sidecar")
+				continue
+			}
+			resTasks = append(resTasks, task)
+		}
+		tg.Tasks = resTasks
+	}
 }
 
 func Must(err error) {

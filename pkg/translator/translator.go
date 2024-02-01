@@ -12,9 +12,11 @@ import (
 	"strings"
 	"text/template"
 
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/yaml"
 
 	"github.com/hashicorp/nomad/api"
+	vsov1 "github.com/hashicorp/vault-secrets-operator/api/v1beta1"
 	"github.com/pkg/errors"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -34,6 +36,8 @@ var (
 	ErrNoNetworkBlock       = errors.New("network mode has to be provided")
 	ErrOnlyContainerSupport = errors.New("pod only support container")
 )
+
+var shouldOpenAIGen = true
 
 type TranslateError struct {
 	Name string
@@ -61,6 +65,14 @@ func (de *DriverNotSupportedError) Error() string {
 	return "task driver " + de.Type + " is not supported"
 }
 
+type K8sResourceInfo struct {
+	metav1.TypeMeta `json:",inline"`
+	// Standard object's metadata.
+	// More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata
+	// +optional
+	metav1.ObjectMeta `json:"metadata,omitempty" protobuf:"bytes,1,opt,name=metadata"`
+}
+
 type Translator struct {
 	DestPath   string
 	NamePrefix string
@@ -68,7 +80,7 @@ type Translator struct {
 
 	Notices Notices
 
-	K8sCRs         []interface{}
+	K8sCRs         []client.Object
 	K8sDeployemnts []*v1.Deployment
 
 	// When Generation CMs, the name could collide based on the original nomad template
@@ -114,14 +126,17 @@ func (t *Translator) Process() error {
 		f.Close()
 	}
 
-	for _, sec := range t.K8sSecret {
-		f, err := os.Create(path.Join(t.DestPath, t.getSecretFileName(sec.Name)))
-		if err != nil {
-			return err
+	// if openai generation is enabled, the secret will be translated into dynamic ones using Vault Secret Operator
+	if !shouldOpenAIGen {
+		for _, sec := range t.K8sSecret {
+			f, err := os.Create(path.Join(t.DestPath, t.getSecretFileName(sec.Name)))
+			if err != nil {
+				return err
+			}
+			content, _ := yaml.Marshal(sec)
+			_, _ = f.Write(content)
+			f.Close()
 		}
-		content, _ := yaml.Marshal(sec)
-		_, _ = f.Write(content)
-		f.Close()
 	}
 
 	for _, srv := range t.K8sServices {
@@ -140,6 +155,17 @@ func (t *Translator) Process() error {
 			return err
 		}
 		content, _ := yaml.Marshal(r)
+		_, _ = f.Write(content)
+		f.Close()
+	}
+
+	for _, cr := range t.K8sCRs {
+		cr.GetName()
+		f, err := os.Create(path.Join(t.DestPath, t.getCRFileName(cr)))
+		if err != nil {
+			return err
+		}
+		content, _ := yaml.Marshal(cr)
 		_, _ = f.Write(content)
 		f.Close()
 	}
@@ -201,7 +227,7 @@ func (t *Translator) genDepoyment(logger zerolog.Logger, tg *api.TaskGroup) (*v1
 	if tg.Scaling != nil {
 		// TODO this might be able to map to HPA?
 		// https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/
-		logger.Warn().Msg("scaling block is not supported")
+		// logger.Warn().Msg("scaling block is not supported")
 	}
 
 	// restart
@@ -232,7 +258,7 @@ func (t *Translator) genDepoyment(logger zerolog.Logger, tg *api.TaskGroup) (*v1
 	//    this is done for services like zk, which is not in the mesh but needs to be connected by other services.
 	//    this use case is no longer a valid one, since in K8s the inter-pod communication happens in overlay network,
 	//    there is no need to expose the host net port anymore.
-	logUnspportedPortUsage(logger, network.ReservedPorts, network.DynamicPorts)
+	t.logUnspportedPortUsage(logger, tg, network.ReservedPorts, network.DynamicPorts)
 
 	// TODO handle tg.Affinities && tg.Constraints, this should merge with job level ones
 
@@ -279,6 +305,21 @@ func (t *Translator) genDepoyment(logger zerolog.Logger, tg *api.TaskGroup) (*v1
 		setImage(&c, task.Config)
 		setArgs(&c, task.Config)
 		delete(task.Config, "cpu_hard_limit")
+
+		if mnt, ok := task.Config["mount"]; ok {
+			t.Notices = append(t.Notices, NoticeItem{
+				Importance: NoticeBroken,
+				Msg:        fmt.Sprintf("task %s has mount (%v) block in config which is not supported. For remounting templates, directly mount the configmap/secret to the destination. For mounting from host, add a hostpath volume", task.Name, mnt),
+			})
+			delete(task.Config, "mount")
+		}
+		if mnt, ok := task.Config["volumes"]; ok {
+			t.Notices = append(t.Notices, NoticeItem{
+				Importance: NoticeBroken,
+				Msg:        fmt.Sprintf("task %s has volumes (%v) block in config which is not supported. For remounting templates, directly mount the configmap/secret to the destination. For mounting from host, add a hostpath volume", task.Name, mnt),
+			})
+			delete(task.Config, "volumes")
+		}
 
 		if len(task.Config) != 0 {
 			logger.Warn().Any("config", task.Config).Msg("unsupported fields in config")
@@ -409,9 +450,13 @@ func (t *Translator) genHttpRoute(logger zerolog.Logger, tg *api.TaskGroup, srv 
 	})
 }
 
-func logUnspportedPortUsage(logger zerolog.Logger, resvPort []api.Port, dynPort []api.Port) {
+func (t *Translator) logUnspportedPortUsage(logger zerolog.Logger, tg *api.TaskGroup, resvPort []api.Port, dynPort []api.Port) {
 	for _, port := range resvPort {
-		logger.Warn().Str("port_label", port.Label).Msg("host port not supported")
+		t.Notices = append(t.Notices, NoticeItem{
+			Importance: NoticeImportant,
+			Msg:        fmt.Sprintf("group %s has static port (%s %d) which is not translated.", *tg.Name, port.Label, port.To),
+		})
+		// logger.Warn().Str("port_label", port.Label).Msg("host port not supported")
 	}
 	for _, port := range dynPort {
 		if strings.ToLower(port.Label) == "exposed" {
@@ -419,7 +464,11 @@ func logUnspportedPortUsage(logger zerolog.Logger, resvPort []api.Port, dynPort 
 			// exposed port is for health checking against mesh jobs
 			continue
 		}
-		logger.Warn().Str("port_label", port.Label).Msg("host port not supported")
+		t.Notices = append(t.Notices, NoticeItem{
+			Importance: NoticeImportant,
+			Msg:        fmt.Sprintf("group %s has dynamic port (%s %d) which is not translated.", *tg.Name, port.Label, port.To),
+		})
+		// logger.Warn().Str("port_label", port.Label).Msg("host port not supported")
 	}
 }
 
@@ -436,7 +485,7 @@ func (t *Translator) genEnv(logger zerolog.Logger, envs map[string]string) []cor
 		v := v
 		if strings.Contains(k, ":") {
 			k = strings.ReplaceAll(k, ":", "__")
-			logger.Info().Str("old", orik).Str("new", k).Msg("env var with : not allowed, renaming")
+			logger.Debug().Str("old", orik).Str("new", k).Msg("env var with : not allowed, renaming")
 		}
 
 		env := corev1.EnvVar{
@@ -520,11 +569,19 @@ func (t *Translator) setTemplates(logger zerolog.Logger, c *corev1.Container, po
 
 		if tpl.EmbeddedTmpl == nil {
 			logger.Warn().Str("source", *tpl.SourcePath).Msg("only embedded data is supported, tpl from remote source ignored")
+			t.Notices = append(t.Notices, NoticeItem{
+				Importance: NoticeBroken,
+				Msg:        fmt.Sprintf("template %s of task %s does not have embeded template, remote source is not suppoted, thus ignored", *tpl.DestPath, task.Name),
+			})
 			continue
 		}
 
 		if !changeModeIsRestart && !changeModeIsNoop {
 			logger.Warn().Str("mode", *tpl.ChangeMode).Msg("only restart/noop change modes are supported. will not handle the change mode for this, need to FIX accordingly")
+			t.Notices = append(t.Notices, NoticeItem{
+				Importance: NoticeImportant,
+				Msg:        fmt.Sprintf("template %s of task %s has change mode of %s, only restart/noop change modes are supported. will not handle the change mode for this, need to FIX accordingly", *tpl.DestPath, task.Name, *tpl.ChangeMode),
+			})
 		}
 
 		tplContent, isSecret, err := t.evalTemplate(logger, c, tpl)
@@ -533,15 +590,7 @@ func (t *Translator) setTemplates(logger zerolog.Logger, c *corev1.Container, po
 				Importance: NoticeBroken,
 				Msg:        fmt.Sprintf("template %s of task %s is not parsable, plz review the translation manually", *tpl.DestPath, task.Name),
 			})
-			logger.Error().Err(err).Msg("parsing failed")
 			continue
-		}
-		if isSecret {
-			t.Notices = append(t.Notices, NoticeItem{
-				Importance: NoticeBroken,
-				Msg:        "plz review ALL secrete type resources, translation is incomplete.",
-				// Msg:        fmt.Sprintf("template %s of task %s is a secrete type, plz review the translation manually", *tpl.DestPath, task.Name),
-			})
 		}
 
 		if isEnv {
@@ -588,6 +637,10 @@ func (t *Translator) setTemplates(logger zerolog.Logger, c *corev1.Container, po
 					} else {
 						unique = true
 						t.K8sSecret[cmName] = cm
+						if shouldOpenAIGen {
+							vSS := t.translateSecretUsingOpenAI(logger, isEnv, tpl, cmName)
+							t.K8sCRs = append(t.K8sCRs, vSS)
+						}
 					}
 				}
 			}
@@ -665,6 +718,11 @@ func (t *Translator) setTemplates(logger zerolog.Logger, c *corev1.Container, po
 					} else {
 						unique = true
 						t.K8sSecret[cmName] = cm
+						if shouldOpenAIGen {
+							vSS := t.translateSecretUsingOpenAI(logger, isEnv, tpl, cmName)
+							vSS.Spec.Destination.Transformation.Templates[filepath.Base(*tpl.DestPath)] = vSS.Spec.Destination.Transformation.Templates["content"]
+							t.K8sCRs = append(t.K8sCRs, vSS)
+						}
 					}
 				}
 			}
@@ -698,13 +756,52 @@ func (t *Translator) setTemplates(logger zerolog.Logger, c *corev1.Container, po
 				volRef.Projected.Sources = append(volRef.Projected.Sources, getVolumeProjectionRef(true, t.getConfigMapName(*tpl.DestPath, cmIdx), false))
 			}
 		}
+	}
 
-		for _, vol := range mountedPaths {
-			podSpec.Volumes = append(podSpec.Volumes, *vol)
-		}
+	for _, vol := range mountedPaths {
+		podSpec.Volumes = append(podSpec.Volumes, *vol)
 	}
 
 	return nil
+}
+
+func (t *Translator) translateSecretUsingOpenAI(logger zerolog.Logger, isEnv bool, tpl *api.Template, cmName string) *vsov1.VaultStaticSecret {
+	logger.Debug().Msg("start translating using openai")
+	oaiTranslateResp, err := CachedTranslateSecretUsingOpenAI(logger, isEnv, *tpl.EmbeddedTmpl)
+	if err != nil {
+		panic(err)
+	}
+	logger.Info().Float32("confidence", oaiTranslateResp.Confidence).Msg("got translation result")
+	if oaiTranslateResp.Confidence < 7 {
+		logger.Debug().Msgf("translation explanation: %s", oaiTranslateResp.Explanation)
+		t.Notices = append(t.Notices, NoticeItem{
+			Importance: NoticeImportant,
+			Msg:        fmt.Sprintf("template %s has a low confidence score (%f) in translation, plz review the translation manually", *tpl.DestPath, oaiTranslateResp.Confidence),
+		})
+	}
+	vSS := oaiTranslateResp.Result
+	vSS.Name = cmName
+	vSS.Spec.Destination.Name = cmName
+	vSS.Spec.RefreshAfter = "1m"
+	// vSS.Spec.VaultAuthRef = t.GetNamePrefix()
+	vSS.Spec.VaultAuthRef = "default"
+	vSS.Annotations = make(map[string]string)
+	vSS.Annotations["confidence"] = fmt.Sprintf("%f", oaiTranslateResp.Confidence)
+	vSS.Spec.Destination.Transformation.Excludes = []string{".*"}
+	vSS.Spec.Destination.Transformation.Templates["__secret_translate_explanation"] = vsov1.Template{
+		Text: oaiTranslateResp.Explanation,
+	}
+	return &vSS
+}
+
+func (t *Translator) getCRFileName(cr client.Object) string {
+	prefix := t.GetNamePrefix()
+	name := cr.GetName()
+	if !strings.HasPrefix(name, prefix) {
+		name = prefix + name
+	}
+
+	return fmt.Sprintf("%s-%s.yml", name, cr.GetObjectKind().GroupVersionKind().Kind)
 }
 
 func (t *Translator) getServiceFileName(name string) string {
@@ -771,7 +868,7 @@ func (t *Translator) evalTemplate(logger zerolog.Logger, c *corev1.Container, nm
 	// baseDest := path.Base(*nmdTpl.DestPath)
 
 	tpl := template.New(*nmdTpl.DestPath)
-	tpl.Funcs(stubTplFuncs(logger, &isSecret))
+	tpl.Funcs(t.stubTplFuncs(logger, nmdTpl, &isSecret))
 	tpl, err = tpl.Parse(*nmdTpl.EmbeddedTmpl)
 	if err != nil {
 		logger.Error().Err(err).Msg("failed to parse template")
@@ -784,20 +881,30 @@ func (t *Translator) evalTemplate(logger zerolog.Logger, c *corev1.Container, nm
 	return buf.String(), isSecret, err
 }
 
-func stubTplFuncs(logger zerolog.Logger, isSecret *bool) template.FuncMap {
+func (t *Translator) stubTplFuncs(logger zerolog.Logger, tpl *api.Template, isSecret *bool) template.FuncMap {
 	return template.FuncMap{
 		"keyOrDefault": func(s, def string) (string, error) {
 			return def, nil
 		},
 		"secret": func(s ...string) (interface{}, error) {
-			logger.Warn().Msg("secret is not supporetd")
+			if !shouldOpenAIGen {
+				logger.Warn().Msg("secret is not supporetd")
+				t.Notices = append(t.Notices, NoticeItem{
+					Importance: NoticeBroken,
+					Msg:        "plz review ALL secrete type resources, translation is incomplete.",
+					// Msg:        fmt.Sprintf("template %s of task %s is a secrete type, plz review the translation manually", *tpl.DestPath, task.Name),
+				})
+			} else {
+				t.Notices = append(t.Notices, NoticeItem{
+					Importance: NoticeImportant,
+					Msg:        "plz review ALL secrete type resources, translation is done to use VaultStaticSecret template, translation might not be accurate.",
+				})
+			}
+
 			*isSecret = true
+
 			return map[string]interface{}{
-				"Data": map[string]interface{}{
-					// "data": map[string]interface{}{
-					// 	"DEVICE_STATE_LOGGING_TOKEN": "FUCKINGA",
-					// },
-				},
+				"Data": map[string]interface{}{},
 			}, nil
 		},
 	}

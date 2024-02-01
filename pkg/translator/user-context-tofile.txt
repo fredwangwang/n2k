@@ -1,0 +1,40 @@
+Here is an example:
+
+Source template:
+```
+{{ with secret "control-plane-services/data/kafka-cert" }}
+{{ .Data.data.auth.ca_cert_intermediate }}
+{{ .Data.data.auth.ca_cert }}
+{{ end }}
+```
+
+Destination:
+```
+apiVersion: secrets.hashicorp.com/v1beta1
+kind: VaultStaticSecret
+metadata:
+  name: secret
+spec:
+  type: kv-v2 # fixed
+  mount: control-plane-services
+  path: kafka-cert
+
+  destination:
+    name: secretkv # fixed
+    create: true # fixed
+    transformation:
+      excludes: [".*"] # fixed
+      templates:
+        # templates has one key for every line within with secret block.
+        # each entry MUST has a `text` field, followed by ehtier Sprig Go template or fixed value
+        
+        # templates has only one entry named `content`
+        # the `text` filed of `content` is the info within secret block in the source template,
+        # with ".Data.data.<key>" changed to ".Secrets.<key>" 
+        content:
+          text: |
+            {{ .Secrets.auth.ca_cert_intermediate }}
+            {{ .Secrets.auth.ca_cert }}
+```
+
+Go through the example carefully, and when answering questions, think step by step, give the best answer you have.

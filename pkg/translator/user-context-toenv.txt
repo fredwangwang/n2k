@@ -1,0 +1,82 @@
+Here are some examples:
+
+1.
+Source template:
+```
+{{ with secret "kvv2mount/data/webapp/config" }}
+test133="{{ .Data.data.username }}"
+KAFKA_CA_CERTIFICATE = "/etc/ssl/certs/kafka_root_ca.pem"
+test2="{{ .Data.data.password }}"
+test3="{{ .Data.data.connection.use_ssl }}"
+{{ end }}
+```
+
+Destination:
+```
+apiVersion: secrets.hashicorp.com/v1beta1
+kind: VaultStaticSecret
+metadata:
+  name: secret
+spec:
+  type: kv-v2 # fixed
+  mount: kvv2mount
+  path: webapp/config
+
+  destination:
+    name: secretkv # fixed
+    create: true # fixed
+    transformation:
+      excludes: [".*"] # fixed
+      templates:
+        # templates has one key for every line within with secret block.
+        # each entry MUST has a `text` field, followed by ehtier Sprig Go template or fixed value
+        test133:
+          text: '{{ .Secrets.username }}' # instead of ".Data.data.<key>", changed to ".Secrets.<key>" 
+        KAFKA_CA_CERTIFICATE:
+          text: "/etc/ssl/certs/kafka_root_ca.pem" # for fixed value the `text` is the value itself
+        test2:
+          text: '{{ .Secrets.password }}'
+        test3:
+          text: '{{ .Secrets.connection.use_ssl }}' # same idea for nested keys, change ".Data.data" to ".Secrets"
+```
+
+2.
+Source template:
+```
+{{ with secret "control-plane-services/data/and-yats" }}
+{{range $v := .Data.data.ClientCredentials}}
+        {{if eq $v.Client_Name "android-management-service"}}
+                AccessTokenServiceOptions__ClientId={{ $v.Client_Id }}
+                AccessTokenServiceOptions__ClientSecret={{$v.Client_Secret}}
+        {{ end }}
+{{ end }}
+{{ end }}
+```
+
+Destination:
+```
+apiVersion: secrets.hashicorp.com/v1beta1 # fixed
+kind: VaultStaticSecret # fixed
+metadata:
+  name: secret # fixed
+spec:
+  type: kv-v2 # fixed
+
+  mount: control-plane-services
+  path: and-yats
+
+  destination:
+    name: secretkv # fixed
+    create: true # fixed
+    transformation:
+      excludes: [".*"] # fixed
+      templates:
+        # templates has one key for every line within with secret block
+        # if there are conditions, apply the conditons separately for all keys
+        AccessTokenServiceOptions__ClientId:
+          text: '{{ range $v := .Secrets.ClientCredentials }}{{if eq $v.Client_Name "android-management-service"}}{{ $v.Client_Id }}{{end}}{{end}}' 
+        AccessTokenServiceOptions__ClientSecret:
+          text: '{{ range $v := .Secrets.ClientCredentials }}{{if eq $v.Client_Name "android-management-service"}}{{ $v.Client_Secret }}{{end}}{{end}}' 
+```
+
+Go through the examples carefully, and when answering questions, think step by step, give the best answer you have.

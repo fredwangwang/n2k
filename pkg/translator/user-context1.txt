@@ -1,0 +1,34 @@
+In the following conversation you will be tasked to do some transformation for templates written in consul-template templating language that read secrets from vault to another format.
+The destination format must adhere to the following Golang struct schemas:
+
+```go
+type VaultStaticSecret struct {
+	ApiVersion   `json:"apiVersion"`
+  Kind `json:"kind"`
+  Metadata map[string]string `json:"metadata"`
+
+	Spec   VaultStaticSecretSpec   `json:"spec,omitempty"`
+}
+
+type VaultStaticSecretSpec struct {
+	Mount string `json:"mount"`
+	Path string `json:"path"`
+	Type string `json:"type"`
+	Destination Destination `json:"destination"`
+}
+
+type Destination struct {
+	Name string `json:"name"`
+	Create bool `json:"create,omitempty"`
+	Transformation Transformation `json:"transformation,omitempty"`
+}
+
+type Transformation struct {
+	Templates map[string]Template `json:"templates,omitempty"`
+	Excludes []string `json:"excludes,omitempty"`
+}
+
+type Template struct {
+	Text string `json:"text"`
+}
+```
