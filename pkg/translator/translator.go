@@ -786,7 +786,7 @@ func (t *Translator) translateSecretUsingOpenAI(logger zerolog.Logger, isEnv boo
 	// vSS.Spec.VaultAuthRef = t.GetNamePrefix()
 	vSS.Spec.VaultAuthRef = "default"
 	vSS.Annotations = make(map[string]string)
-	vSS.Annotations["confidence"] = fmt.Sprintf("%f", oaiTranslateResp.Confidence)
+	vSS.Annotations["confidence"] = fmt.Sprintf("%.1f", oaiTranslateResp.Confidence)
 	vSS.Spec.Destination.Transformation.Excludes = []string{".*"}
 	vSS.Spec.Destination.Transformation.Templates["__secret_translate_explanation"] = vsov1.Template{
 		Text: oaiTranslateResp.Explanation,
@@ -916,11 +916,27 @@ func (t *Translator) getConfigMapName(name string, idx int) string {
 	if idx != 0 {
 		return basename + strconv.Itoa(idx)
 	}
-	return strings.TrimSuffix(basename, filepath.Ext(basename))
+	return sanitizeResourceName(strings.TrimSuffix(basename, filepath.Ext(basename)))
 }
 
 func (t *Translator) getDefaultConfigMapName(name string, idx int) string {
 	return t.getConfigMapName(name, idx) + "-default"
+}
+
+var validNameRe = regexp.MustCompile(`[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*`)
+
+func sanitizeResourceName(in string) string {
+	// https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#dns-subdomain-names
+
+	res := strings.ToLower(strings.ReplaceAll(in, "_", "-"))
+	if !validNameRe.MatchString(res) {
+		panic(fmt.Errorf("failed to sanitize name: (%s -> %s): the processed name does not fits validation regex: %s", in, res, validNameRe.String()))
+	}
+	if len(res) > 253 {
+		panic(fmt.Errorf("resource name %s is too long (limit 253)", res))
+	}
+
+	return strings.ToLower(strings.ReplaceAll(in, "_", "-"))
 }
 
 func formatVolumeConfigMap(logger zerolog.Logger, name, content, destPath string) (*corev1.ConfigMap, error) {
