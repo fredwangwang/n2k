@@ -25,9 +25,6 @@ spec:
     transformation:
       excludes: [".*"] # fixed
       templates:
-        # templates has one key for every line within with secret block.
-        # each entry MUST has a `text` field, followed by ehtier Sprig Go template or fixed value
-        
         # templates has only one entry named `content`
         # the `text` filed of `content` is the info within secret block in the source template,
         # with ".Data.data.<key>" changed to ".Secrets.<key>" 

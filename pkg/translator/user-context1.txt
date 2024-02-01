@@ -3,11 +3,10 @@ The destination format must adhere to the following Golang struct schemas:
 
 ```go
 type VaultStaticSecret struct {
-	ApiVersion   `json:"apiVersion"`
-  Kind `json:"kind"`
-  Metadata map[string]string `json:"metadata"`
-
-	Spec   VaultStaticSecretSpec   `json:"spec,omitempty"`
+	ApiVersion `json:"apiVersion"`
+	Kind `json:"kind"`
+	Metadata map[string]string `json:"metadata"`
+	Spec VaultStaticSecretSpec `json:"spec,omitempty"`
 }
 
 type VaultStaticSecretSpec struct {
