@@ -45,7 +45,7 @@ func (ns Notices) String() string {
 			builder.WriteString("\n# " + n.Importance.String() + "\n\n")
 			currentImportance = int(n.Importance)
 		}
-		builder.WriteString(fmt.Sprintf("* %s\n", n.Msg))
+		builder.WriteString(fmt.Sprintf("* [ ] %s\n", n.Msg))
 	}
 
 	return builder.String()
