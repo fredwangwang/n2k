@@ -806,9 +806,16 @@ func (t *Translator) translateSecretUsingOpenAI(logger zerolog.Logger, isEnv boo
 	vSS.Spec.VaultAuthRef = "default"
 	vSS.Annotations = make(map[string]string)
 	vSS.Annotations["confidence"] = fmt.Sprintf("%.1f", oaiTranslateResp.Confidence)
+	vSS.Spec.Destination.Create = true
 	vSS.Spec.Destination.Transformation.Excludes = []string{".*"}
 	vSS.Spec.Destination.Transformation.Templates["__secret_translate_explanation"] = vsov1.Template{
-		Text: oaiTranslateResp.Explanation,
+		Text: strings.ReplaceAll(
+			strings.ReplaceAll(
+				strings.ReplaceAll(
+					oaiTranslateResp.Explanation,
+					"{", ""),
+				"}", ""),
+			"`", "'"),
 	}
 	return &vSS
 }
