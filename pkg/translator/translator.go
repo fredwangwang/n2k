@@ -22,6 +22,7 @@ import (
 	"github.com/rs/zerolog/log"
 	v1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
@@ -295,6 +296,22 @@ func (t *Translator) genDepoyment(logger zerolog.Logger, tg *api.TaskGroup) (*v1
 
 		c.Name = task.Name
 		c.Env = t.genEnv(logger, task.Env)
+
+		cpuReq := 100
+		if task.Resources != nil && task.Resources.CPU != nil {
+			cpuReq = *task.Resources.CPU
+		}
+		memReq := 256
+		if task.Resources != nil && task.Resources.MemoryMB != nil {
+			memReq = *task.Resources.MemoryMB
+		}
+		c.Resources.Requests = corev1.ResourceList{
+			"cpu":    resource.MustParse(strconv.Itoa(cpuReq) + "m"),
+			"memory": resource.MustParse(strconv.Itoa(memReq) + "Mi"),
+		}
+		c.Resources.Limits = corev1.ResourceList{
+			"memory": *c.Resources.Requests.Memory(),
+		}
 
 		// logs
 		// TODO: is it able to be handled? maybe not
