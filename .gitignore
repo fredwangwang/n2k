@@ -18,3 +18,5 @@
 n2k
 
 generated-k8s/
+secret_gen_cache
+*.bolt

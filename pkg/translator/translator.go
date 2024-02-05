@@ -8,10 +8,12 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"text/template"
 
+	"golang.org/x/exp/maps"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/yaml"
 
@@ -275,6 +277,7 @@ func (t *Translator) genDepoyment(logger zerolog.Logger, tg *api.TaskGroup) (*v1
 	// service block handled in genService method
 
 	// check
+	// https://developer.hashicorp.com/nomad/docs/job-specification/check
 	// TODO: check stanza to healthcheck
 
 	podTpl := corev1.PodTemplateSpec{}
@@ -503,10 +506,13 @@ func (t *Translator) genEnv(logger zerolog.Logger, envs map[string]string) []cor
 
 	res := make([]corev1.EnvVar, 0, len(envs))
 
-	for k, v := range envs {
+	keys := maps.Keys(envs)
+	sort.Strings(keys)
+
+	for _, k := range keys {
 		orik := k
 		k := k
-		v := v
+		v := envs[k]
 		if strings.Contains(k, ":") {
 			k = strings.ReplaceAll(k, ":", "__")
 			logger.Debug().Str("old", orik).Str("new", k).Msg("env var with : not allowed, renaming")
@@ -764,7 +770,7 @@ func (t *Translator) setTemplates(logger zerolog.Logger, c *corev1.Container, po
 			if vol, ok := mountedPaths[mountPath]; ok {
 				volRef = vol
 			} else {
-				volName := task.Name + strings.ReplaceAll(mountPath, "/", "-")
+				volName := strings.ReplaceAll(mountPath[1:], "/", "-")
 
 				volRef = &corev1.Volume{
 					Name: volName,
@@ -794,8 +800,10 @@ func (t *Translator) setTemplates(logger zerolog.Logger, c *corev1.Container, po
 		}
 	}
 
-	for _, vol := range mountedPaths {
-		podSpec.Volumes = append(podSpec.Volumes, *vol)
+	mountedPathKyes := maps.Keys(mountedPaths)
+	sort.Strings(mountedPathKyes)
+	for _, path := range mountedPathKyes {
+		podSpec.Volumes = append(podSpec.Volumes, *mountedPaths[path])
 	}
 
 	return strings.Join(cmReloaderTags, ","), strings.Join(secretReloaderTags, ","), nil
@@ -957,10 +965,11 @@ func (t *Translator) stubTplFuncs(logger zerolog.Logger, tpl *api.Template, isSe
 func (t *Translator) getConfigMapName(name string, idx int) string {
 	basename := t.GetNamePrefix() + "-" + strings.ReplaceAll(name, "/", "-")
 	basename = strings.TrimSuffix(basename, filepath.Ext(basename))
+	sanitized := sanitizeResourceName(strings.TrimSuffix(basename, filepath.Ext(basename)))
 	if idx != 0 {
-		return basename + strconv.Itoa(idx)
+		return sanitized + strconv.Itoa(idx)
 	}
-	return sanitizeResourceName(strings.TrimSuffix(basename, filepath.Ext(basename)))
+	return sanitized
 }
 
 func (t *Translator) getDefaultConfigMapName(name string, idx int) string {
@@ -980,7 +989,7 @@ func sanitizeResourceName(in string) string {
 		panic(fmt.Errorf("resource name %s is too long (limit 253)", res))
 	}
 
-	return strings.ToLower(strings.ReplaceAll(in, "_", "-"))
+	return res
 }
 
 func formatVolumeConfigMap(logger zerolog.Logger, name, content, destPath string) (*corev1.ConfigMap, error) {

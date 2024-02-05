@@ -3,9 +3,11 @@ package translator
 import (
 	"context"
 	"crypto/sha1"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -41,13 +43,54 @@ var (
 	bucketName = "secret_translate_cache"
 )
 
+var (
+	cacheDirName = "secret_gen_cache"
+)
+
 type StructuredResponse struct {
 	Result      vsov1.VaultStaticSecret `yaml:"result" json:"result"`
 	Confidence  float32                 `yaml:"confidence" json:"confidence"`
 	Explanation string                  `yaml:"explanation" json:"explanation"`
 }
 
-func CachedTranslateSecretUsingOpenAI(logger zerolog.Logger, isEnv bool, tpl string) (*StructuredResponse, error) {
+func fileCache(logger zerolog.Logger, isEnv bool, tpl string) (*StructuredResponse, error) {
+	var err error
+
+	err = os.MkdirAll(cacheDirName, 0o755)
+	if err != nil {
+		return nil, err
+	}
+
+	key := sha1.Sum([]byte(tpl))
+	cacheFilename := filepath.Join(cacheDirName, hex.EncodeToString(key[:]))
+
+	var val []byte
+	if val, err = os.ReadFile(cacheFilename); err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+
+	if val == nil {
+		res, err := TranslateSecretUsingOpenAI(logger, isEnv, tpl)
+		if err != nil {
+			return nil, err
+		}
+		val, _ := yaml.Marshal(res)
+
+		_ = os.WriteFile(cacheFilename, val, 0o644)
+
+		return res, nil
+	}
+
+	res := StructuredResponse{}
+	err = yaml.Unmarshal([]byte(replaceDataDataWithSecrets(string(val))), &res)
+	if err != nil {
+		fmt.Println(string(val))
+		fmt.Println(string(y2jmap(val)))
+	}
+	return &res, err
+}
+
+func boltCache(logger zerolog.Logger, isEnv bool, tpl string) (*StructuredResponse, error) {
 	var err error
 
 	if dbhandle == nil {
@@ -93,6 +136,10 @@ func CachedTranslateSecretUsingOpenAI(logger zerolog.Logger, isEnv bool, tpl str
 		fmt.Println(string(y2jmap(val)))
 	}
 	return &res, err
+}
+
+func CachedTranslateSecretUsingOpenAI(logger zerolog.Logger, isEnv bool, tpl string) (*StructuredResponse, error) {
+	return fileCache(logger, isEnv, tpl)
 }
 
 func TranslateSecretUsingOpenAI(logger zerolog.Logger, isEnv bool, tpl string) (*StructuredResponse, error) {

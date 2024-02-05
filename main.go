@@ -19,6 +19,11 @@ func main() {
 	log.Logger = log.Level(zerolog.DebugLevel)
 	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
 
+	if len(os.Args) != 2 {
+		log.Error().Msgf("usage: %s <path to nomad job file>", os.Args[0])
+		os.Exit(1)
+	}
+
 	jobGetter := command.JobGetter{}
 	jobGetter.HCL1 = true // bc, most of the jobs that we have are not HCL2 compatible
 
@@ -26,7 +31,7 @@ func main() {
 		panic(err)
 	}
 
-	_, job, err := jobGetter.Get("/home/huan/workspace/n2k/examples/device-state/device-state.nomad")
+	_, job, err := jobGetter.Get(os.Args[1])
 	if err != nil {
 		panic(err)
 	}
