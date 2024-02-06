@@ -326,8 +326,12 @@ func (t *Translator) genDepoyment(logger zerolog.Logger, tg *api.TaskGroup) (*v1
 			return nil, err
 		}
 
-		dep.Annotations[ReloaderConfigMapAnnotationKey] = cmReloaderTags
-		dep.Annotations[ReloaderSecretAnnotationKey] = secretReloaderTags
+		if cmReloaderTags != "" {
+			dep.Annotations[ReloaderConfigMapAnnotationKey] = cmReloaderTags
+		}
+		if secretReloaderTags != "" {
+			dep.Annotations[ReloaderSecretAnnotationKey] = secretReloaderTags
+		}
 
 		setImage(&c, task.Config)
 		setArgs(&c, task.Config)
